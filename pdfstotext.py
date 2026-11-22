@@ -1,12 +1,14 @@
 """
-pdftotext.py — PDF to AI-friendly UTF-8 text extractor
-=======================================================
+pdfstotext.py — PDF to AI-friendly UTF-8 text extractor
+========================================================
+
+Named pdfstotext (not pdftotext) so it never clashes with Poppler's pdftotext.
 
 AI TOOL QUICK REFERENCE
 -----------------------
 Usage:
-    python pdftotext.py <pdf> [options]
-    python pdftotext.py <pdf> --batch [options]   # suppress human prompts
+    python pdfstotext.py <pdf> [options]
+    python pdfstotext.py <pdf> --batch [options]   # suppress human prompts
 
 Key options:
     -o PATH               Output .txt file (default: <pdf>.txt)
@@ -71,7 +73,10 @@ import subprocess
 import sys
 import tempfile
 
-import pymupdf
+try:
+    import pymupdf
+except ImportError:
+    sys.exit("ERROR: PyMuPDF is not installed. Install it with: pip install pymupdf")
 
 
 # ---------------------------------------------------------------------------
@@ -83,10 +88,13 @@ SEPARATOR_NL = SEPARATOR + "\n"   # pre-built to avoid repeated string concat
 
 DEFAULT_DELIMITER              = "§"   # absent from most documents
 MIN_SUBSTANTIAL_TEXT_CHARS     = 40
+TABLE_OVERLAP_SUPPRESS_RATIO   = 0.4   # text block hidden if this much of it lies in a table
+Y_BUCKET_PT                    = 3     # items within this many points count as one row
 DEFAULT_OCR_DPI                = 300
 DEFAULT_OCR_LANGUAGE           = "eng"
 DEFAULT_OCR_VECTOR_THRESHOLD   = 1000
 MIN_PYMUPDF_PARTIAL_OCR_VER    = (1, 27, 2)
+OCR_MAX_FAILURES_IN_A_ROW      = 3     # then OCR is switched off for the rest of the run
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +240,21 @@ def _overlap_ratio(block_rect: pymupdf.Rect, table_rect: pymupdf.Rect) -> float:
     return intersection.get_area() / block_area
 
 
+def _merge_by_position(text_items: list[_Item], others: list[_Item]) -> list[_Item]:
+    """Keep text_items in their given order; insert each of `others` (sorted by
+    position) before the first remaining text item that starts lower on the page."""
+    merged: list[_Item] = []
+    pending = sorted(others, key=lambda item: (item.y, item.x))
+    i = 0
+    for text_item in text_items:
+        while i < len(pending) and pending[i].y <= text_item.y:
+            merged.append(pending[i])
+            i += 1
+        merged.append(text_item)
+    merged.extend(pending[i:])
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # Image marker
 # ---------------------------------------------------------------------------
@@ -365,9 +388,9 @@ def _extract_page(
     ocr_vector_threshold: int,
     tessdata: str | None,
 ) -> tuple[str, int, int, int, int | None, _OcrResult]:
-    items: list[_Item]                              = []
-    table_bboxes: list[tuple[float, float, float, float]] = []
-    table_rects:  list[pymupdf.Rect]               = []   # pre-built for overlap checks
+    items: list[_Item]             = []   # page markers, images, tables
+    text_items: list[_Item]        = []   # text blocks
+    table_rects: list[pymupdf.Rect] = []  # pre-built for overlap checks
 
     table_count      = 0
     image_count      = 0
@@ -410,8 +433,14 @@ def _extract_page(
         print(f"WARNING: Image detection failed on page "
               f"{page.number + 1}: {exc}", file=sys.stderr)
 
-    # OCR: skip the native-text count when OCR is off (saves a get_text call per page)
-    native_chars = 0 if ocr_mode == "off" else len(page.get_text("text").strip())
+    # One native TextPage per page, reused for the OCR decision and (if OCR does
+    # not run) for the text blocks, instead of extracting the page text twice.
+    native_textpage = page.get_textpage(flags=pymupdf.TEXTFLAGS_BLOCKS)
+    native_blocks   = page.get_text("blocks", textpage=native_textpage, sort=sort)
+    native_chars    = sum(
+        len(b[4].strip()) for b in native_blocks
+        if b[4] and not (len(b) > 6 and b[6] == 1)
+    )
     should_ocr, full_page_ocr, ocr_reason = _choose_ocr(
         ocr_mode=ocr_mode,
         native_text_chars=native_chars,
@@ -433,18 +462,21 @@ def _extract_page(
             f"| error: {ocr_result.error} ]]"
         )
         items.append(_Item(y=page.rect.y0, x=page.rect.x0, text=marker))
-        if not ocr_result.succeeded:
-            print(f"WARNING: OCR failed on page {page.number + 1}: {ocr_result.error}",
-                  file=sys.stderr)
+        # Failure warnings are printed by extract_pdf, which also stops OCR after
+        # repeated failures.
 
-    # Tables — must run before text-block loop so overlap suppression works
+    # Tables — must run before text-block loop so overlap suppression works.
+    # find_tables is by far the slowest step. Its default "lines" strategy needs
+    # drawn lines and cell text, so skip it when the page has no drawings (count
+    # known to be 0) or no native text.
+    no_drawings = vector_path_count == 0
     try:
-        for table in page.find_tables().tables:
+        tables = [] if (no_drawings or native_chars == 0) else page.find_tables().tables
+        for table in tables:
             rendered = _render_delimited_table(table, delimiter)
             if not rendered.strip():
                 continue
             table_count += 1
-            table_bboxes.append(table.bbox)
             table_rects.append(pymupdf.Rect(table.bbox))
             actual_text_chars += len(rendered.replace(delimiter, "").strip())
             items.append(_Item(
@@ -462,25 +494,33 @@ def _extract_page(
         print(f"WARNING: Table detection failed on page "
               f"{page.number + 1}: {exc}", file=sys.stderr)
 
-    # Text blocks — table Rects pre-computed above, reused here for every block
-    text_kwargs: dict = {"sort": sort}
-    if ocr_result.textpage is not None:
-        text_kwargs["textpage"] = ocr_result.textpage
-
-    for block in page.get_text("blocks", **text_kwargs):
-        x0, y0, x1, y1 = block[0], block[1], block[2], block[3]
-        if block[6] if len(block) > 6 else 0:
+    # Text blocks — reuse the native blocks unless OCR produced its own TextPage
+    blocks = (
+        native_blocks if ocr_result.textpage is None
+        else page.get_text("blocks", textpage=ocr_result.textpage, sort=sort)
+    )
+    for block in blocks:
+        if len(block) > 6 and block[6] == 1:
             continue   # image block — already handled via get_image_info
-        block_rect = pymupdf.Rect(x0, y0, x1, y1)
-        if any(_overlap_ratio(block_rect, tr) > 0.4 for tr in table_rects):
-            continue
         text = block[4].strip() if block[4] else ""
-        if text:
-            actual_text_chars += len(text)
-            items.append(_Item(y=y0, x=x0, text=text))
+        if not text:
+            continue
+        if table_rects:
+            block_rect = pymupdf.Rect(block[:4])
+            if any(_overlap_ratio(block_rect, tr) > TABLE_OVERLAP_SUPPRESS_RATIO
+                   for tr in table_rects):
+                continue
+        actual_text_chars += len(text)
+        text_items.append(_Item(y=block[1], x=block[0], text=text))
 
-    # 3 pt Y buckets group same-row items across columns, then left-to-right
-    items.sort(key=lambda item: (round(item.y / 3) * 3, item.x))
+    if sort:
+        # Y buckets group same-row items across columns, then left-to-right
+        items.extend(text_items)
+        items.sort(key=lambda item: (round(item.y / Y_BUCKET_PT) * Y_BUCKET_PT, item.x))
+    else:
+        # --original-order: keep the PDF's text order; place each marker/table
+        # before the first text block that starts below it.
+        items = _merge_by_position(text_items, items)
     content = "\n\n".join(item.text for item in items)
 
     return content, actual_text_chars, table_count, image_count, vector_path_count, ocr_result
@@ -496,6 +536,7 @@ def _ai_guidance(
     line_numbers: bool,
     detect_vector_graphics: bool,
     ocr_mode: str,
+    ocr_off_reason: str | None = None,
 ) -> str:
     line_ref = (
         "Use prefixed global line numbers together with page markers for precise references."
@@ -510,9 +551,16 @@ def _ai_guidance(
     )
     ocr_note = (
         "Selective OCR was enabled. [[ OCR APPLIED ... ]] identifies pages where OCR text "
-        "was added. Treat OCR text as potentially inaccurate; verify critical values.\n"
+        "was added. Treat OCR text as potentially inaccurate; verify critical values. "
+        "[[ OCR STOPPED ... ]] means OCR was switched off after repeated failures; "
+        "later pages contain native text only.\n"
         if ocr_mode != "off"
-        else "OCR was disabled for this extraction.\n"
+        else (
+            f"OCR was requested but turned off: {ocr_off_reason}. Scanned pages may lack "
+            "text; tell the user OCR language data is missing.\n"
+            if ocr_off_reason
+            else "OCR was disabled for this extraction.\n"
+        )
     )
     return (
         "[[ AI ASSISTANT REFERENCE INSTRUCTIONS START ]]\n"
@@ -536,11 +584,15 @@ def _ai_guidance(
 # Page marker (includes PDF logical label when it differs from sequence number)
 # ---------------------------------------------------------------------------
 
-def _page_marker(page: pymupdf.Page, page_number: int, total_pages: int) -> str:
-    try:
-        label = page.get_label()
-    except Exception:
-        label = ""
+def _page_marker(
+    page: pymupdf.Page, page_number: int, total_pages: int, has_labels: bool,
+) -> str:
+    label = ""
+    if has_labels:   # get_label() re-reads the label tree on every call
+        try:
+            label = page.get_label()
+        except Exception:
+            label = ""
     if label and label != str(page_number):
         return f"[[ PAGE {page_number} / {total_pages} | PDF LABEL: {label} ]]"
     return f"[[ PAGE {page_number} / {total_pages} ]]"
@@ -560,7 +612,7 @@ def _startup_info(args: argparse.Namespace, ocr_default: str) -> None:
     ocr_mode = args.ocr_mode
 
     print("=" * 60)
-    print("pdftotext — PDF to AI-friendly text extractor")
+    print("pdfstotext — PDF to AI-friendly text extractor")
     print("=" * 60)
 
     print("\nDEPENDENCIES:")
@@ -645,15 +697,25 @@ def extract_pdf(
 
     _validate_delimiter(delimiter)
     _warn_for_older_pymupdf(ocr_mode)
+
+    # Without language data every OCR attempt fails (and Tesseract prints several
+    # error lines per page), so switch OCR off for the whole run instead.
+    requested_ocr_mode = ocr_mode
+    ocr_off_reason: str | None = None
     if ocr_mode != "off":
         tessdata_ok, tessdata_detail = _pymupdf_tessdata_info(tessdata, ocr_language)
         if not tessdata_ok:
+            ocr_mode = "off"
+            ocr_off_reason = f"OCR language data not available: {tessdata_detail}"
             print(
-                f"WARNING: PyMuPDF OCR language data not ready: {tessdata_detail}. "
-                "OCR attempts may fail. "
+                f"WARNING: OCR turned off for this run: {ocr_off_reason}. "
                 "Install Tesseract language files or pass --tessdata PATH.",
                 file=sys.stderr,
             )
+    ocr_mode_label = (
+        ocr_mode.upper() if ocr_off_reason is None
+        else f"OFF (REQUESTED {requested_ocr_mode.upper()}; {ocr_off_reason})"
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     document = pymupdf.open(input_path)
@@ -673,7 +735,13 @@ def extract_pdf(
         ocr_attempted              = 0
         ocr_succeeded              = 0
         ocr_failed                 = 0
+        ocr_failed_in_a_row        = 0
+        ocr_stopped_page: int | None = None   # page after which OCR was switched off
         global_line                = 1
+        try:
+            has_labels = bool(document.get_page_labels())
+        except Exception:
+            has_labels = False
 
         # Write to temp file; rename atomically on success to avoid partial output
         with tempfile.NamedTemporaryFile(
@@ -689,7 +757,7 @@ def extract_pdf(
                 f" | PAGES: {total_pages}"
                 f" | DELIMITER: {delimiter}"
                 f" | LINE NUMBERS: {'ON' if line_numbers else 'OFF'}"
-                f" | OCR MODE: {ocr_mode.upper()}"
+                f" | OCR MODE: {ocr_mode_label}"
                 f" | VECTOR DETECTION: {'ON' if detect_vector_graphics else 'OFF'}"
                 f" | PYMUPDF: {pymupdf.__version__} ]]\n"
             )
@@ -698,7 +766,7 @@ def extract_pdf(
             if include_ai_guidance:
                 out.write(_ai_guidance(
                     input_path.name, delimiter, line_numbers,
-                    detect_vector_graphics, ocr_mode,
+                    detect_vector_graphics, ocr_mode, ocr_off_reason,
                 ))
                 out.write(SEPARATOR_NL)
 
@@ -713,7 +781,7 @@ def extract_pdf(
                     sort=sort_text,
                     delimiter=delimiter,
                     detect_vector_graphics=detect_vector_graphics,
-                    ocr_mode=ocr_mode,
+                    ocr_mode=ocr_mode if ocr_stopped_page is None else "off",
                     ocr_language=ocr_language,
                     ocr_dpi=ocr_dpi,
                     ocr_vector_threshold=ocr_vector_threshold,
@@ -735,11 +803,25 @@ def extract_pdf(
                     ocr_attempted += 1
                     if ocr_result.succeeded:
                         ocr_succeeded += 1
+                        ocr_failed_in_a_row = 0
                     else:
                         ocr_failed += 1
+                        ocr_failed_in_a_row += 1
+                        print(f"WARNING: OCR failed on page {page_number}: "
+                              f"{ocr_result.error}", file=sys.stderr)
+                        if ocr_failed_in_a_row >= OCR_MAX_FAILURES_IN_A_ROW:
+                            ocr_stopped_page = page_number
+                            stop_note = (
+                                f"[[ OCR STOPPED: failed on {ocr_failed_in_a_row} pages "
+                                f"in a row; pages after {page_number} were not OCR'd ]]"
+                            )
+                            content = f"{content}\n\n{stop_note}" if content else stop_note
+                            print(f"WARNING: OCR stopped after {ocr_failed_in_a_row} "
+                                  f"failures in a row (last on page {page_number}); "
+                                  "remaining pages use native text only.", file=sys.stderr)
 
                 out.write(f"\n{SEPARATOR_NL}")
-                out.write(_page_marker(page, page_number, total_pages) + "\n")
+                out.write(_page_marker(page, page_number, total_pages, has_labels) + "\n")
                 out.write(f"{SEPARATOR_NL}\n")
 
                 if not content:
@@ -747,9 +829,12 @@ def extract_pdf(
                     continue
 
                 if line_numbers:
-                    for line in content.splitlines():
-                        out.write(f"{global_line:>6} | {line}\n")
-                        global_line += 1
+                    lines = content.splitlines()
+                    out.write("".join(
+                        f"{n:>6} | {line}\n"
+                        for n, line in enumerate(lines, start=global_line)
+                    ))
+                    global_line += len(lines)
                 else:
                     out.write(content + "\n")
 
@@ -768,10 +853,13 @@ def extract_pdf(
                 f"[[ VECTOR DRAWING PATHS FOUND: "
                 f"{total_vector_paths if detect_vector_graphics else 'NOT CHECKED'} ]]\n"
             )
-            out.write(f"[[ OCR MODE: {ocr_mode.upper()} ]]\n")
+            out.write(f"[[ OCR MODE: {ocr_mode_label} ]]\n")
             out.write(f"[[ OCR PAGES ATTEMPTED: {ocr_attempted} ]]\n")
             out.write(f"[[ OCR PAGES SUCCEEDED: {ocr_succeeded} ]]\n")
             out.write(f"[[ OCR PAGES FAILED: {ocr_failed} ]]\n")
+            if ocr_stopped_page is not None:
+                out.write(f"[[ OCR STOPPED AFTER PAGE: {ocr_stopped_page} "
+                          f"({OCR_MAX_FAILURES_IN_A_ROW} failures in a row) ]]\n")
 
         os.replace(tmp_path, output_path)
         tmp_path = None
@@ -791,17 +879,14 @@ def extract_pdf(
     )
 
     if pages_with_substantial_text < max(1, total_pages // 4):
-        ocr_hint = "" if ocr_mode != "off" else " Try --ocr-mode auto if Tesseract is installed."
+        ocr_hint = (
+            "" if ocr_mode != "off"
+            else " OCR could recover text once language data is available."
+            if ocr_off_reason else " Try --ocr-mode auto if Tesseract is installed."
+        )
         print(
             f"WARNING: Very little selectable text extracted. "
             f"May be a scanned or visually oriented PDF.{ocr_hint}",
-            file=sys.stderr,
-        )
-    if ocr_failed:
-        print(
-            "WARNING: OCR failed on one or more pages. "
-            "Requires Tesseract-OCR installed and accessible. "
-            "Use --ocr-mode off to disable, or --tessdata to specify the tessdata folder.",
             file=sys.stderr,
         )
 
@@ -811,10 +896,22 @@ def extract_pdf(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # Windows consoles (cp1252 etc.) cannot print every character in a file name;
+    # replace instead of crashing after the output file was already written.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+    # This script does not use pymupdf_layout; silence PyMuPDF's stdout hint about it.
+    getattr(pymupdf, "no_recommend_layout", lambda: None)()
+
     # Check tessdata readiness — more accurate than executable PATH check because
     # PyMuPDF OCR works without tesseract in PATH if the language files exist.
     # Both caches are warm after this; _startup_info reuses them for free.
-    tessdata_ok, _ = _pymupdf_tessdata_info(language=DEFAULT_OCR_LANGUAGE)
+    # Positional args on purpose: lru_cache keys f(a, b) and f(b=...) differently,
+    # and the later calls are positional.
+    tessdata_ok, _ = _pymupdf_tessdata_info(None, DEFAULT_OCR_LANGUAGE)
     ocr_default    = "auto" if tessdata_ok else "off"
 
     parser = argparse.ArgumentParser(

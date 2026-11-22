@@ -2,6 +2,9 @@
 
 **A Python CLI that converts PDF files into structured, AI-optimised UTF-8 text.**
 
+> The script and command are named **`pdfstotext`** (not `pdftotext`) so they never clash with
+> Poppler's widely installed `pdftotext` utility.
+
 Rather than hoping an AI assistant can "read" a PDF on its own, this tool produces a clean, consistently formatted `.txt` file that any AI — or any human — can reliably parse, cite, and reason over.
 
 ---
@@ -57,7 +60,7 @@ The default delimiter is `§` — a character absent from almost all documents �
 **Shell one-liner (replace delimiter with comma):**
 ```bash
 # extract the table block, replace § with ,
-sed -n '/TABLE 1 START/,/TABLE 1 END/p' report.pdf.txt \
+sed -n '/TABLE 1 START/,/TABLE 1 END/p' report.txt \
   | grep -v '^\[\[' \
   | tr '§' ',' > table1.csv
 ```
@@ -66,7 +69,7 @@ sed -n '/TABLE 1 START/,/TABLE 1 END/p' report.pdf.txt \
 ```python
 import csv, re
 
-text = open("report.pdf.txt", encoding="utf-8").read()
+text = open("report.txt", encoding="utf-8").read()
 block = re.search(r"\[\[ TABLE 1 START \]\]\n(.*?)\n\[\[ TABLE 1 END \]\]", text, re.DOTALL)
 if block:
     rows = [line.split("§") for line in block.group(1).splitlines() if line.strip()]
@@ -77,7 +80,7 @@ if block:
 You can also change the delimiter at extraction time — useful if your PDFs contain `§`:
 
 ```bash
-pdftotext report.pdf --batch --force -d "|"
+pdfstotext report.pdf --batch --force -d "|"
 ```
 
 ---
@@ -108,23 +111,23 @@ pip install "pymupdf>=1.23.0"
 # Linux:   sudo apt install tesseract-ocr
 
 # Run directly
-python pdftotext.py report.pdf --batch --force
+python pdfstotext.py report.pdf --batch --force
 ```
 
 ### Optional wrapper (run from anywhere)
 
-To call `pdftotext` as a command from any directory, add a thin wrapper to a folder on your `PATH`:
+To call `pdfstotext` as a command from any directory, add a thin wrapper to a folder on your `PATH`:
 
-**Windows (`pdftotext.cmd`):**
+**Windows (`pdfstotext.cmd`):**
 ```bat
 @echo off
-python "C:\path\to\ai-tool-pdftotext\pdftotext.py" %*
+python "C:\path\to\ai-tool-pdftotext\pdfstotext.py" %*
 ```
 
-**macOS / Linux (`pdftotext` shell script):**
+**macOS / Linux (`pdfstotext` shell script):**
 ```bash
 #!/usr/bin/env bash
-exec python3 /path/to/ai-tool-pdftotext/pdftotext.py "$@"
+exec python3 /path/to/ai-tool-pdftotext/pdfstotext.py "$@"
 ```
 
 ---
@@ -132,29 +135,29 @@ exec python3 /path/to/ai-tool-pdftotext/pdftotext.py "$@"
 ## Usage
 
 ```
-python pdftotext.py <pdf> [options]
+python pdfstotext.py <pdf> [options]
 ```
 
 ### Quick examples
 
 ```bash
-# Basic extraction (produces report.pdf.txt)
-python pdftotext.py report.pdf --batch --force
+# Basic extraction (produces report.txt)
+python pdfstotext.py report.pdf --batch --force
 
 # Add global line numbers for precise AI references
-python pdftotext.py report.pdf --batch --force --line-numbers
+python pdfstotext.py report.pdf --batch --force --line-numbers
 
 # Enable OCR for scanned PDFs
-python pdftotext.py scan.pdf --batch --force --ocr-mode all
+python pdfstotext.py scan.pdf --batch --force --ocr-mode all
 
 # Multi-language OCR
-python pdftotext.py doc.pdf --batch --force --ocr-mode auto --ocr-language eng+deu
+python pdfstotext.py doc.pdf --batch --force --ocr-mode auto --ocr-language eng+deu
 
 # Custom output path and delimiter
-python pdftotext.py data.pdf --batch --force -o output/data.txt -d "|"
+python pdfstotext.py data.pdf --batch --force -o output/data.txt -d "|"
 
 # Run interactively to see dependency status and active options
-python pdftotext.py report.pdf
+python pdfstotext.py report.pdf
 ```
 
 ### All options
