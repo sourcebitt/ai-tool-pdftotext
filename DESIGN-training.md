@@ -62,6 +62,11 @@ The installed "fast" models cannot be fine-tuned; put the tessdata_best model fo
 `base/` first (https://github.com/tesseract-ocr/tessdata_best). Characters that the base model does
 not know cannot be learned this way.
 
+The official models have not been retrained since 2017, so no automatic update check is done. Each
+version records the SHA-256 of the base model it was built on; if the file in `base/` is replaced,
+`status` says so. Because every version is trained from the base plus all confirmed lines, moving to
+a new base is just another `train`, compared and promoted like any other version.
+
 ## Training notice
 At the start of a run with OCR enabled, pdfstotext checks the queue. If one of these holds and no
 notice was given within `notice_interval_hours`, it writes one line to its console output and to the

@@ -192,6 +192,10 @@ class Store:
         self.db = sqlite3.connect(self.root / DB_NAME, timeout=30)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        columns = {r["name"] for r in self.db.execute("PRAGMA table_info(models)")}
+        if "base_sha" not in columns:   # added later: fingerprint of the base model used
+            self.db.execute("ALTER TABLE models ADD COLUMN base_sha TEXT")
+            self.db.commit()
         self.config = self._load_config()
 
     # -- lifecycle --------------------------------------------------------
@@ -612,8 +616,9 @@ class Store:
         with self.db:
             self.db.execute(
                 "INSERT INTO models(version, lang, created_at, train_lines, eval_lines, iterations, "
-                "cer_base, cer_new) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
-                (version, lang, _now(), len(train_rows), len(eval_list), iterations, cer_base, cer_new),
+                "cer_base, cer_new, base_sha) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (version, lang, _now(), len(train_rows), len(eval_list), iterations, cer_base, cer_new,
+                 file_fingerprint(base)),
             )
         shutil.rmtree(work / "ckpt", ignore_errors=True)
         return {"version": version, "train_lines": len(train_list), "eval_lines": len(eval_list),
@@ -656,6 +661,17 @@ class Store:
             log(f"WARNING: could not read the evaluation result for {model.name}.")
             return None
         return float(match.group(1))
+
+    def base_changed(self, lang: str) -> str | None:
+        """A note if base/<lang>.traineddata differs from the one the latest model was trained on."""
+        latest = self.latest_model(lang)
+        base = self.root / "base" / f"{lang}.traineddata"
+        if not latest or not latest["base_sha"] or not base.is_file():
+            return None
+        if file_fingerprint(base) == latest["base_sha"]:
+            return None
+        return (f"NOTE: base/{base.name} has changed since {latest['version']} was trained; "
+                f"run train to build a version on the new base and compare.")
 
     def evaluate_version(self, version: str, log=print) -> tuple[float | None, float | None]:
         """Re-score a model and the stock base on that version's evaluation lines."""
@@ -761,6 +777,9 @@ class Store:
         for lang in sorted({*langs, "eng"}):
             current = self.current_model(lang)
             out.append(f"OCR model in use ({lang}): {current or 'stock'}")
+            base_note = self.base_changed(lang)
+            if base_note:
+                out.append(base_note)
         job = self.get_meta("training_job")
         if job:
             info = json.loads(job)
