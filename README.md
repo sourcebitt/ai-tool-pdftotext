@@ -179,6 +179,31 @@ python pdfstotext.py report.pdf
 | `--force` | off | Overwrite an existing output file |
 | `--batch` | off | Suppress interactive startup summary (use in scripts and AI tools) |
 | `--debug` | off | Print full Python traceback on error |
+| `--no-harvest` | off | Do not queue OCR'd pages for OCR training |
+| `--no-notice` | off | Do not print the OCR training notice |
+| `--stock-model` | off | Ignore a promoted custom OCR model |
+
+---
+
+## OCR training (optional)
+
+pdfstotext can improve its OCR over time. Low-confidence OCR lines are collected while you use the tool,
+reviewed later in a separate session (an AI reads each line image, you confirm or correct its readings),
+and used to fine-tune a custom Tesseract model. Only lines you confirm are used for training.
+
+```bash
+python pdfstotext_trn.py init        # opt in: creates the data folder ($PDFSTOTEXT_TRN_DIR or ~/pdfstotext_trn)
+# put tessdata_best/eng.traineddata into <data folder>/base/
+python pdfstotext_trn.py status      # what is queued, waiting for review, ready to train
+python pdfstotext_trn.py scan        # cut low-confidence lines from queued pages
+python pdfstotext_trn.py next        # review, then: suggest / confirm / skip / illegible
+python pdfstotext_trn.py train       # new model version + error rate against the stock model
+python pdfstotext_trn.py promote eng_custom_v1
+```
+
+When enough material has built up, pdfstotext prints a one-line `[[ TRAINING NOTICE ... ]]` (at most once a
+day) so the AI using it can tell you that a training session is due. An MCP server (`pdfstotext_mcp.py`,
+needs `pip install mcp`) exposes the same steps as tools for an AI session. Details: [DESIGN-training.md](DESIGN-training.md).
 
 ---
 

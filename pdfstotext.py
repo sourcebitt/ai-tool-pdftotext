@@ -109,6 +109,11 @@ class _Item:
 
 
 @dataclass
+class ExtractResult:
+    ocr_pages: list[int]   # 1-based pages where OCR succeeded
+
+
+@dataclass
 class _OcrResult:
     textpage: object | None
     attempted: bool
@@ -678,7 +683,8 @@ def extract_pdf(
     ocr_dpi: int = DEFAULT_OCR_DPI,
     ocr_vector_threshold: int = DEFAULT_OCR_VECTOR_THRESHOLD,
     tessdata: str | None = None,
-) -> None:
+    notice: str | None = None,
+) -> ExtractResult:
     """Extract an AI-friendly UTF-8 text representation of a PDF."""
     if not input_path.is_file():
         raise FileNotFoundError(f"PDF not found: {input_path}")
@@ -737,6 +743,7 @@ def extract_pdf(
         ocr_failed                 = 0
         ocr_failed_in_a_row        = 0
         ocr_stopped_page: int | None = None   # page after which OCR was switched off
+        ocr_pages: list[int]       = []
         global_line                = 1
         try:
             has_labels = bool(document.get_page_labels())
@@ -761,6 +768,8 @@ def extract_pdf(
                 f" | VECTOR DETECTION: {'ON' if detect_vector_graphics else 'OFF'}"
                 f" | PYMUPDF: {pymupdf.__version__} ]]\n"
             )
+            if notice:
+                out.write(notice + "\n")
             out.write(SEPARATOR_NL)
 
             if include_ai_guidance:
@@ -804,6 +813,7 @@ def extract_pdf(
                     if ocr_result.succeeded:
                         ocr_succeeded += 1
                         ocr_failed_in_a_row = 0
+                        ocr_pages.append(page_number)
                     else:
                         ocr_failed += 1
                         ocr_failed_in_a_row += 1
@@ -889,6 +899,7 @@ def extract_pdf(
             f"May be a scanned or visually oriented PDF.{ocr_hint}",
             file=sys.stderr,
         )
+    return ExtractResult(ocr_pages=ocr_pages)
 
 
 # ---------------------------------------------------------------------------
@@ -997,6 +1008,20 @@ def main() -> None:
         "--debug", action="store_true",
         help="Show a full Python traceback when an error occurs.",
     )
+    training = parser.add_argument_group(
+        "OCR training (active only after 'pdfstotext_trn.py init'; see DESIGN-training.md)")
+    training.add_argument(
+        "--no-harvest", action="store_true",
+        help="Do not queue this PDF's OCR'd pages for OCR training.",
+    )
+    training.add_argument(
+        "--no-notice", action="store_true",
+        help="Do not print a notice when an OCR training session is due.",
+    )
+    training.add_argument(
+        "--stock-model", action="store_true",
+        help="Use the stock Tesseract model even if a custom model has been promoted.",
+    )
 
     args = parser.parse_args()
 
@@ -1006,7 +1031,21 @@ def main() -> None:
     input_path  = args.pdf.resolve()
     output_path = args.output.resolve() if args.output else input_path.with_suffix(".txt")
 
-    extract_pdf(
+    # Optional OCR training store: promoted custom model, notice, harvest.
+    store = _open_training_store()
+    ocr_language, tessdata = args.ocr_language, args.tessdata
+    if store is not None and not args.stock_model and not args.tessdata:
+        promoted = store.ocr_model_for(args.ocr_language)
+        if promoted:
+            ocr_language, tessdata = promoted
+    notice = None
+    if store is not None and not args.no_notice and args.ocr_mode != "off":
+        try:
+            notice = store.training_notice()
+        except Exception as exc:
+            print(f"WARNING: OCR training notice check failed: {exc}", file=sys.stderr)
+
+    result = extract_pdf(
         input_path=input_path,
         output_path=output_path,
         sort_text=not args.original_order,
@@ -1016,11 +1055,35 @@ def main() -> None:
         detect_vector_graphics=not args.no_vector_detection,
         force=args.force,
         ocr_mode=args.ocr_mode,
-        ocr_language=args.ocr_language,
+        ocr_language=ocr_language,
         ocr_dpi=args.ocr_dpi,
         ocr_vector_threshold=args.ocr_vector_threshold,
-        tessdata=args.tessdata,
+        tessdata=tessdata,
+        notice=notice,
     )
+
+    if store is not None:
+        if not args.no_harvest and result.ocr_pages:
+            try:
+                store.harvest(input_path, result.ocr_pages, args.ocr_dpi, args.ocr_language)
+            except Exception as exc:   # training must never break extraction
+                print(f"WARNING: could not queue pages for OCR training: {exc}", file=sys.stderr)
+        store.close()
+    if notice:
+        print(notice)
+
+
+def _open_training_store():
+    """The OCR training store if training has been initialised, else None."""
+    try:
+        import pdfstotext_trn
+    except ImportError:
+        return None
+    try:
+        return pdfstotext_trn.Store.open_if_enabled()
+    except Exception as exc:
+        print(f"WARNING: OCR training data unavailable: {exc}", file=sys.stderr)
+        return None
 
 
 if __name__ == "__main__":
