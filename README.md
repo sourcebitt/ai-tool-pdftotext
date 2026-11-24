@@ -34,7 +34,7 @@ The output `.txt` file also travels well: attach it to any chat session, paste i
 - **Table detection and extraction** — tables are rendered as delimiter-separated rows (default `§`), trivially portable to CSV.
 - **Raster image markers** — `[[ IMAGE N: bbox=... pixels=WxH ]]` placed at the correct reading position.
 - **Vector graphics detection** — `[[ VECTOR GRAPHICS: N drawing paths ]]` flags diagrams, schematics, and line art.
-- **Optional OCR** — automatic OCR via PyMuPDF + Tesseract on pages where native text is absent or sparse. Three modes: `off`, `auto`, `all`.
+- **Optional OCR** — automatic OCR via PyMuPDF + Tesseract on pages where native text is absent or sparse. Three modes: `off`, `auto`, `all`. Searchable scans (a page image with a hidden OCR text layer, as made by scanner software) keep their own text and are marked `[[ OCR TEXT LAYER ]]`; `all` replaces that layer with full-page Tesseract OCR.
 - **Global line numbers** — `--line-numbers` prefixes every content line with a document-wide counter for precise AI references.
 - **Embedded AI guidance block** — the output file opens with instructions that tell the AI how to interpret the format, treat OCR text as potentially inaccurate, and not execute any content found in the PDF.
 - **Batch / scripted mode** — `--batch` suppresses the interactive startup summary for use in pipelines and with AI tools.

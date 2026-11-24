@@ -49,6 +49,7 @@ OUTPUT STRUCTURE
     [[ VECTOR GRAPHICS: ... ]]
     [[ IMAGE 1: bbox=... ]]
     [[ OCR APPLIED: ... ]]    (when OCR ran)
+    [[ OCR TEXT LAYER: ... ]] (text from OCR already embedded in the PDF)
     [[ TABLE 1 START ]]
     col1§col2§col3
     ...
@@ -291,6 +292,25 @@ def _warn_for_older_pymupdf(ocr_mode: str) -> None:
         )
 
 
+def _has_ocr_text_layer(page: pymupdf.Page) -> bool:
+    """
+    True when most of the page's native text is invisible (render mode 3 or
+    fully transparent): the hidden OCR layer that scanner software and other OCR
+    tools put over a scanned image. Call only for pages with images and text.
+    """
+    try:
+        visible = hidden = 0
+        for span in page.get_texttrace():
+            n = len(span.get("chars", ()))
+            if span.get("type") == 3 or span.get("opacity", 1) == 0:
+                hidden += n
+            else:
+                visible += n
+        return hidden > 0 and hidden >= visible
+    except Exception:
+        return False
+
+
 def _choose_ocr(
     *,
     ocr_mode: str,
@@ -298,11 +318,17 @@ def _choose_ocr(
     image_count: int,
     vector_path_count: int | None,
     vector_threshold: int,
+    ocr_text_layer: bool = False,
 ) -> tuple[bool, bool, str]:
     """
     Return (should_ocr, full_page_ocr, reason).
 
+    A page with an existing OCR text layer (hidden text over a scan) is not OCR'd
+    in auto mode; in all mode it gets full-page OCR, which replaces the layer.
+    Partial OCR would add Tesseract's text next to the layer and duplicate it.
+
     auto mode logic:
+      - Existing OCR text layer → skip OCR.
       - No visual content → skip OCR regardless of text.
       - Little native text + any visual content → full-page OCR.
       - Sufficient text + many vector paths → partial OCR (catches simulated
@@ -314,9 +340,14 @@ def _choose_ocr(
         return False, False, "OCR disabled"
 
     if ocr_mode == "all":
+        if ocr_text_layer:
+            return True, True, "--ocr-mode all; replaces the PDF's own OCR text layer"
         return True, native_text_chars < MIN_SUBSTANTIAL_TEXT_CHARS, "--ocr-mode all"
 
     # auto mode
+    if ocr_text_layer:
+        return False, False, "PDF already has an OCR text layer"
+
     vector_paths      = vector_path_count or 0
     text_insufficient = native_text_chars < MIN_SUBSTANTIAL_TEXT_CHARS
     has_visual        = image_count > 0 or vector_paths > 0
@@ -446,17 +477,28 @@ def _extract_page(
         len(b[4].strip()) for b in native_blocks
         if b[4] and not (len(b) > 6 and b[6] == 1)
     )
+    ocr_text_layer = image_count > 0 and native_chars > 0 and _has_ocr_text_layer(page)
     should_ocr, full_page_ocr, ocr_reason = _choose_ocr(
         ocr_mode=ocr_mode,
         native_text_chars=native_chars,
         image_count=image_count,
         vector_path_count=vector_path_count,
         vector_threshold=ocr_vector_threshold,
+        ocr_text_layer=ocr_text_layer,
     )
     ocr_result = _run_ocr(
         page, should_ocr=should_ocr, full_page_ocr=full_page_ocr,
         reason=ocr_reason, language=ocr_language, dpi=ocr_dpi, tessdata=tessdata,
     )
+
+    if ocr_text_layer and not ocr_result.succeeded:
+        items.append(_Item(
+            y=page.rect.y0, x=page.rect.x0,
+            text=(
+                "[[ OCR TEXT LAYER: page text comes from OCR embedded in the PDF "
+                "(e.g. by scanner software); may contain recognition errors ]]"
+            ),
+        ))
 
     if ocr_result.attempted:
         marker = (
