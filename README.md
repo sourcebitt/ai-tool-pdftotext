@@ -1,4 +1,4 @@
-# ai-tool-pdftotext
+# pdfstotext
 
 **A Python CLI that converts PDF files into structured, AI-optimised UTF-8 text.**
 
@@ -99,8 +99,8 @@ pdfstotext report.pdf --batch --force -d "|"
 
 ```bash
 # Clone the repository
-git clone https://github.com/sourcebitt/ai-tool-pdftotext.git
-cd ai-tool-pdftotext
+git clone https://github.com/sourcebitt/pdfstotext.git
+cd pdfstotext
 
 # Install the Python dependency
 pip install "pymupdf>=1.23.0"
@@ -121,13 +121,13 @@ To call `pdfstotext` as a command from any directory, add a thin wrapper to a fo
 **Windows (`pdfstotext.cmd`):**
 ```bat
 @echo off
-python "C:\path\to\ai-tool-pdftotext\pdfstotext.py" %*
+python "C:\path\to\pdfstotext\pdfstotext.py" %*
 ```
 
 **macOS / Linux (`pdfstotext` shell script):**
 ```bash
 #!/usr/bin/env bash
-exec python3 /path/to/ai-tool-pdftotext/pdfstotext.py "$@"
+exec python3 /path/to/pdfstotext/pdfstotext.py "$@"
 ```
 
 ---
@@ -299,4 +299,4 @@ SOFTWARE.
 
 ---
 
-*Source: https://github.com/sourcebitt/ai-tool-pdftotext*
+*Source: https://github.com/sourcebitt/pdfstotext*
